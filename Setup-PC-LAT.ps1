@@ -1,4 +1,3 @@
-@@ -0,0 +1,221 @@
 # ============================================================
 #  Setup-PC-LAT.ps1
 #  Configuracion estandar de notebooks - IT LAT
