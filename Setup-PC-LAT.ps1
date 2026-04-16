@@ -50,38 +50,43 @@ function Create-Users {
     $users = @(
         @{ Name = "msfadmin10";  Password = '$oporteMSFLAT';  IsAdmin = $true  },
         @{ Name = "msfadminLAT"; Password = '$oporteMSFLAT!'; IsAdmin = $true  },
-        @{ Name = "msf";     Password = 'usuarioBOA24*';    IsAdmin = $false }
+        @{ Name = "msf";         Password = 'usuarioBOA24*';  IsAdmin = $false }
     )
 
     foreach ($u in $users) {
-        $securePass = ConvertTo-SecureString $u.Password -AsPlainText -Force
 
-        # Verificar si el usuario ya existe
-        $existing = Get-LocalUser -Name $u.Name -ErrorAction SilentlyContinue
-        if ($existing) {
-            Write-Log "  [SKIP] Usuario '$($u.Name)' ya existe. Se omite creacion." "Yellow"
+        # Verificar si existe
+        net user $u.Name > $null 2>&1
+
+        if ($LASTEXITCODE -eq 0) {
+            Write-Log "  [SKIP] Usuario '$($u.Name)' ya existe." "Yellow"
         } else {
             try {
-                New-LocalUser -Name $u.Name `
-                              -Password $securePass `
-                              -FullName $u.Name `
-                              -Description "Creado por Setup-PC-LAT" `
-                              -PasswordNeverExpires `
-                              -ErrorAction Stop | Out-Null
+                # Crear usuario
+                net user $u.Name $u.Password /add /y | Out-Null
 
+                # Password nunca expira
+                wmic UserAccount where "Name='$($u.Name)'" set PasswordExpires=FALSE | Out-Null
+
+                # Usuario no puede cambiar password
+                net user $u.Name /passwordchg:no | Out-Null
+
+                # Agregar a grupo
                 if ($u.IsAdmin) {
-                    Add-LocalGroupMember -Group "Administrators" -Member $u.Name -ErrorAction Stop
-                    Write-Log "  [OK] Usuario ADMIN '$($u.Name)' creado correctamente." "Green"
+                    net localgroup Administrators $u.Name /add | Out-Null
+                    Write-Log "  [OK] Usuario ADMIN '$($u.Name)' creado." "Green"
                 } else {
-                    Add-LocalGroupMember -Group "Users" -Member $u.Name -ErrorAction SilentlyContinue
-                    Write-Log "  [OK] Usuario ESTANDAR '$($u.Name)' creado correctamente." "Green"
+                    net localgroup Users $u.Name /add | Out-Null
+                    Write-Log "  [OK] Usuario ESTANDAR '$($u.Name)' creado." "Green"
                 }
+
             } catch {
                 Write-Log "  [ERROR] No se pudo crear '$($u.Name)': $_" "Red"
                 $script:ErrorCount++
             }
         }
     }
+
     Write-Host ""
 }
 #endregion
