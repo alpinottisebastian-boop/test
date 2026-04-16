@@ -78,11 +78,5 @@ function Create-Users {
 }
 #endregion
 
-#region --- EJECUCION PRINCIPAL ---
-Show-Banner
-Create-Users
-$wingetOk = Ensure-Winget
-if ($wingetOk) { Install-Apps }
-Apply-WindowsConfig
 Show-Summary
 #endregion
