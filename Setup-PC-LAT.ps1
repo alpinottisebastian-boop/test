@@ -4,7 +4,7 @@
 #  Autor: IT Support LAT
 #  Uso: Ejecutar como Administrador en PowerShell
 # ============================================================
-
+ 
 #region --- VERIFICACION DE PRIVILEGIOS ---
 if (-not ([Security.Principal.WindowsPrincipal] [Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
     Write-Host "`n[ERROR] Este script debe ejecutarse como Administrador." -ForegroundColor Red
