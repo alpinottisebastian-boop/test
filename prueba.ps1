@@ -107,23 +107,16 @@ function Create-Users {
 #endregion
 
 #region --- PASO 2: VERIFICAR / INSTALAR WINGET ---
-function Ensure-Winget {
-    Write-Log "=== PASO 2: VERIFICANDO WINGET ===" "Cyan"
-
-    $winget = Get-Command winget -ErrorAction SilentlyContinue
-    if ($winget) {
-        Write-Log "  [OK] winget disponible: $($winget.Source)" "Green"
-        return $true
-    }
-
-    Write-Log "  [INFO] winget no encontrado. Intentando instalar App Installer..." "Yellow"
+function Install-Winget {
+    Write-Log "  [INFO] Descargando e instalando App Installer desde GitHub..." "Yellow"
     try {
-        $releases = Invoke-RestMethod "https://api.github.com/repos/microsoft/winget-cli/releases/latest"
+        $releases = Invoke-RestMethod "https://api.github.com/repos/microsoft/winget-cli/releases/latest" `
+                                      -UseBasicParsing
         $msixUrl  = ($releases.assets | Where-Object { $_.name -like "*.msixbundle" })[0].browser_download_url
         $msixPath = "$env:TEMP\AppInstaller.msixbundle"
         Invoke-WebRequest -Uri $msixUrl -OutFile $msixPath -UseBasicParsing
-        Add-AppxPackage -Path $msixPath
-        Write-Log "  [OK] winget instalado correctamente." "Green"
+        Add-AppxPackage -Path $msixPath -ErrorAction Stop
+        Write-Log "  [OK] winget instalado/reinstalado correctamente." "Green"
         return $true
     } catch {
         Write-Log "  [ERROR] No se pudo instalar winget: $_" "Red"
@@ -132,39 +125,239 @@ function Ensure-Winget {
         return $false
     }
 }
+
+function Ensure-Winget {
+    Write-Log "=== PASO 2: VERIFICANDO WINGET ===" "Cyan"
+
+    # 1. Verificar que el comando existe
+    $wingetCmd = Get-Command winget -ErrorAction SilentlyContinue
+    if (-not $wingetCmd) {
+        Write-Log "  [INFO] winget no encontrado en el sistema." "Yellow"
+        return (Install-Winget)
+    }
+
+    # 2. Verificar que realmente funciona (no solo que existe)
+    try {
+        $ver = & winget --version 2>&1
+        if ($LASTEXITCODE -eq 0 -and "$ver" -match "v[\d\.]+") {
+            Write-Log "  [OK] winget operativo: $ver" "Green"
+            return $true
+        } else {
+            Write-Log "  [WARN] winget existe pero no responde correctamente (exit: $LASTEXITCODE). Reinstalando..." "Yellow"
+            return (Install-Winget)
+        }
+    } catch {
+        Write-Log "  [WARN] winget lanzo excepcion al ejecutarse. Reinstalando..." "Yellow"
+        return (Install-Winget)
+    }
+}
 #endregion
 
-#region --- PASO 3: INSTALAR APLICACIONES ---
-function Install-Apps {
-    Write-Log "=== PASO 3: INSTALACION DE APLICACIONES ===" "Cyan"
+#region --- PASO 3: INSTALAR / ACTUALIZAR APLICACIONES ---
+function Install-App-Direct {
+    # Instalacion directa sin verificacion previa - rapido y sin riesgo de cuelgue
+    param([string]$Name, [string]$Id)
+    Write-Log "  Instalando: $Name..." "White"
+    try {
+        winget install --id $Id `
+                       --silent `
+                       --accept-package-agreements `
+                       --accept-source-agreements `
+                       2>&1 | Out-Null
 
-    $apps = @(
-        @{ Name = "VLC Media Player";     Id = "VideoLAN.VLC"                   },
-        @{ Name = "7-Zip";                Id = "7zip.7zip"                       },
-        @{ Name = "IrfanView";            Id = "IrfanSkiljan.IrfanView"          },
-        @{ Name = "TeamViewer Host";      Id = "TeamViewer.TeamViewer.Host"      },
-        @{ Name = "Microsoft Office 365"; Id = "Microsoft.Office"                }
+        if ($LASTEXITCODE -eq 0 -or $LASTEXITCODE -eq -1978335189) {
+            # -1978335189 = ya instalado segun winget, se considera OK
+            Write-Log "  [OK] $Name instalado / ya presente." "Green"
+        } else {
+            Write-Log "  [WARN] $Name - codigo salida: $LASTEXITCODE" "Yellow"
+        }
+    } catch {
+        Write-Log "  [ERROR] Excepcion instalando $Name`: $_" "Red"
+        $script:ErrorCount++
+    }
+}
+
+function Get-TeamViewerInstalled {
+    # Detecta cualquier version de TeamViewer via registro de Windows
+    # Mas confiable que winget list para versiones viejas (TV12, TV14, etc.)
+    $regPaths = @(
+        "HKLM:\SOFTWARE\TeamViewer",
+        "HKLM:\SOFTWARE\WOW6432Node\TeamViewer",
+        "HKCU:\SOFTWARE\TeamViewer"
+    )
+    foreach ($path in $regPaths) {
+        if (Test-Path $path) { return $true }
+    }
+    return $false
+}
+
+function Uninstall-TeamViewer {
+    $uninstallPaths = @(
+        "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall",
+        "HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall"
     )
 
-    foreach ($app in $apps) {
-        Write-Log "  Instalando: $($app.Name)..." "White"
-        try {
-            winget install --id $app.Id `
+    $found = $false
+
+    foreach ($basePath in $uninstallPaths) {
+        Get-ChildItem $basePath -ErrorAction SilentlyContinue | ForEach-Object {
+            $entry = Get-ItemProperty $_.PsPath -ErrorAction SilentlyContinue
+            if ($entry.DisplayName -like "*TeamViewer*") {
+                $found = $true
+                $uninstStr = $entry.UninstallString
+                Write-Log "  Desinstalando: $($entry.DisplayName) v$($entry.DisplayVersion)..." "White"
+                Write-Log "  [DEBUG] UninstallString raw: $uninstStr" "DarkGray"
+
+                if (-not $uninstStr) {
+                    Write-Log "  [WARN] UninstallString vacio, omitiendo." "Yellow"
+                    return
+                }
+
+                try {
+                    $exe  = $null
+                    $args = "/S"
+
+                    if ($uninstStr -match '^"([^"]+\.exe)"') {
+                        # Formato con comillas: "C:\path\uninstall.exe"
+                        $exe = $matches[1]
+                    } elseif ($uninstStr -match 'MsiExec') {
+                        # Formato MSI
+                        $exe  = "msiexec.exe"
+                        $args = ($uninstStr -replace "MsiExec\.exe\s*", "").Trim() + " /quiet /norestart"
+                    } elseif ($uninstStr -match '^([^\s"]+\.exe)') {
+                        # Formato sin comillas: C:\path\uninstall.exe
+                        $exe = $matches[1]
+                    }
+
+                    # Fallback: rutas conocidas de TV12 si el exe no existe
+                    if (-not $exe -or -not (Test-Path $exe)) {
+                        Write-Log "  [WARN] Exe no encontrado en UninstallString. Buscando rutas conocidas TV12..." "Yellow"
+                        $fallbacks = @(
+                            "$env:ProgramFiles\TeamViewer\Version12\uninstall.exe",
+                            "${env:ProgramFiles(x86)}\TeamViewer\Version12\uninstall.exe",
+                            "$env:ProgramFiles\TeamViewer\uninstall.exe",
+                            "${env:ProgramFiles(x86)}\TeamViewer\uninstall.exe"
+                        )
+                        foreach ($fb in $fallbacks) {
+                            if (Test-Path $fb) { $exe = $fb; break }
+                        }
+                    }
+
+                    if ($exe -and (Test-Path $exe)) {
+                        Write-Log "  [INFO] Ejecutando: $exe $args" "DarkGray"
+                        Start-Process -FilePath $exe -ArgumentList $args -Wait -NoNewWindow -ErrorAction Stop
+                        Write-Log "  [OK] Version anterior desinstalada." "Green"
+                    } else {
+                        Write-Log "  [WARN] No se encontro ejecutable valido para desinstalar." "Yellow"
+                    }
+
+                } catch {
+                    Write-Log "  [WARN] Error durante desinstalacion: $_" "Yellow"
+                }
+            }
+        }
+    }
+
+    if (-not $found) {
+        Write-Log "  [INFO] No se encontraron entradas de TeamViewer en el registro." "DarkGray"
+    }
+}
+
+function Install-TeamViewer {
+    $tvName = "TeamViewer Host"
+    $tvId   = "TeamViewer.TeamViewer.Host"
+
+    Write-Log "  Procesando: $tvName..." "White"
+    try {
+        # 1. Detectar si hay cualquier version instalada (incluye TV12, TV14, etc.)
+        $installedViaRegistry = Get-TeamViewerInstalled
+        $installedViaWinget   = $false
+        if ($installedViaRegistry) {
+            winget list --id $tvId -e 2>&1 | Out-Null
+            $installedViaWinget = ($LASTEXITCODE -eq 0)
+        }
+
+        if (-not $installedViaRegistry) {
+            # --- CASO A: No instalado en absoluto -> instalar directo ---
+            Write-Log "  TeamViewer no encontrado. Instalando..." "White"
+            winget install --id $tvId `
                            --silent `
                            --accept-package-agreements `
                            --accept-source-agreements `
                            2>&1 | Out-Null
 
-            if ($LASTEXITCODE -eq 0 -or $LASTEXITCODE -eq -1978335189) {
-                Write-Log "  [OK] $($app.Name) instalado / ya presente." "Green"
+            if ($LASTEXITCODE -eq 0) {
+                Write-Log "  [OK] $tvName instalado correctamente." "Green"
             } else {
-                Write-Log "  [WARN] $($app.Name) - codigo salida: $LASTEXITCODE" "Yellow"
+                Write-Log "  [ERROR] $tvName fallo al instalar (exit: $LASTEXITCODE)." "Red"
+                $script:ErrorCount++
             }
-        } catch {
-            Write-Log "  [ERROR] Fallo instalando $($app.Name): $_" "Red"
-            $script:ErrorCount++
+
+        } elseif ($installedViaWinget) {
+            # --- CASO B: Instalado y reconocido por winget -> upgrade ---
+            Write-Log "  TeamViewer encontrado (winget). Actualizando..." "White"
+            winget upgrade --id $tvId `
+                           --silent `
+                           --accept-package-agreements `
+                           --accept-source-agreements `
+                           2>&1 | Out-Null
+
+            if ($LASTEXITCODE -eq 0) {
+                Write-Log "  [OK] $tvName actualizado correctamente." "Green"
+            } else {
+                Write-Log "  [WARN] Upgrade fallo (exit: $LASTEXITCODE). Reinstalando con --force..." "Yellow"
+                winget install --id $tvId `
+                               --silent --force `
+                               --accept-package-agreements `
+                               --accept-source-agreements `
+                               2>&1 | Out-Null
+
+                if ($LASTEXITCODE -eq 0) {
+                    Write-Log "  [OK] $tvName reinstalado correctamente (--force)." "Green"
+                } else {
+                    Write-Log "  [ERROR] $tvName fallo con --force (exit: $LASTEXITCODE)." "Red"
+                    $script:ErrorCount++
+                }
+            }
+
+        } else {
+            # --- CASO C: Instalado por instalador viejo (TV12/14), winget no lo ve ---
+            # Desinstalar version legacy y luego instalar limpio
+            Write-Log "  TeamViewer legacy detectado (no gestionado por winget). Migrando..." "Yellow"
+            Uninstall-TeamViewer
+            Start-Sleep -Seconds 5
+
+            winget install --id $tvId `
+                           --silent `
+                           --accept-package-agreements `
+                           --accept-source-agreements `
+                           2>&1 | Out-Null
+
+            if ($LASTEXITCODE -eq 0) {
+                Write-Log "  [OK] $tvName migrado e instalado correctamente." "Green"
+            } else {
+                Write-Log "  [ERROR] $tvName fallo tras desinstalar legacy (exit: $LASTEXITCODE)." "Red"
+                $script:ErrorCount++
+            }
         }
+
+    } catch {
+        Write-Log "  [ERROR] Excepcion procesando $tvName`: $_" "Red"
+        $script:ErrorCount++
     }
+}
+
+function Install-Apps {
+    Write-Log "=== PASO 3: INSTALACION DE APLICACIONES ===" "Cyan"
+
+    # Instalacion directa (sin verificacion de version - rapido, sin cuelgues)
+    Install-App-Direct "VLC Media Player"     "VideoLAN.VLC"
+    Install-App-Direct "7-Zip"                "7zip.7zip"
+    Install-App-Direct "IrfanView"            "IrfanSkiljan.IrfanView"
+    Install-App-Direct "Microsoft Office 365" "Microsoft.Office"
+
+    # TeamViewer: logica especial con upgrade y fallback --force
+    Install-TeamViewer
 
     Write-Host ""
 }
